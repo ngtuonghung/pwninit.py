@@ -64,12 +64,12 @@ class LibcVersion:
         return None
 
     @property
-    def is_glibc(self):
-        return "GLIBC" in self.flavour
-
-    @property
     def is_eglibc(self):
         return "EGLIBC" in self.flavour
+
+    @property
+    def is_glibc(self):
+        return "GLIBC" in self.flavour and not self.is_eglibc
 
     @property
     def glibc_type(self):
@@ -87,6 +87,8 @@ class LibcVersion:
 
     @property
     def libc_dbg_debname(self):
+        # for multiarch ones:
+        # e.g. libc6-i386-dbgsym_2.35-0ubuntu3.10_amd64.ddeb
         if self.pkgname and self.arch:
             return f"libc6-dbg_{self.pkgname}_{self.arch}.deb"
         return None
@@ -105,6 +107,8 @@ class LibcVersion:
         if self.os == "Debian":
             if self.is_glibc:
                 return "https://deb.debian.org/debian/pool/main/g/glibc/"
+            # for unstable releases:
+            # https://deb.sipwise.com/debian/pool/main/g/glibc/
         return None
 
     def _format_pkgurl(self, debname):
@@ -130,18 +134,31 @@ class LibcVersion:
         return {
             "amd64": "x86_64-linux-gnu",
             "i386": "i386-linux-gnu",
+            "arm64": "aarch64-linux-gnu",
+            "armel": "arm-linux-gnueabi",
+            "armhf": "arm-linux-gnueabihf",
+            "mipsel": "mipsel-linux-gnu",
+            "mips64el": "mips64el-linux-gnuabi64",
+            "pp64el": "powerpc64le-linux-gnu",
+            "s390x": "s390x-linux-gnu",
         }.get(self.arch, None)
-
-    @property
-    def can_fetch_files(self):
-        return bool(self.pkgname)
 
     def get_libc6_pkg_paths(self, name):
         return [
             os.path.join(f"./lib/{self.arch_linux_gnu}/", name),
             # seems to be used in ubuntu glibc 2.39
             os.path.join(f"./usr/lib/{self.arch_linux_gnu}/", name),
+            # os.path.join(f"./usr/lib{bits}/", name),  # for libc6-i386_amd64 (32) / libc6-amd64_i386 (64) packages
         ]
+    
+    @property
+    def supported_architectures(self):
+        if self.os == "Ubuntu":
+            # supports libc6-armel_armhf not armel
+            return ["amd64", "i386", "arm64", "armhf", "ppc64el", "riscv64", "s390x"]
+        if self.os == "Debian":
+            return ["amd64", "i386", "arm64", "armel", "armhf", "mipsel", "mips64el", "ppc64el", "riscv64", "s390x"]
+        return []
 
     def __str__(self):
         return self.raw
@@ -232,7 +249,10 @@ def fetch_missing_libraries(missing, libraries, version):
     if version is None:
         log.error(f"Can't fetch {missing_list} without knowing the libc version")
         return False
-    if not version.can_fetch_files:
+    if version.arch not in version.supported_architectures:
+        log.error(f"Architecture {version.arch!r} not supported by {version.os!r}")
+        return False
+    if not version.pkgname:
         log.error(f"Can't fetch {missing_list} as libc doesn't have a package name")
         return False
     dsts = []
@@ -532,8 +552,6 @@ if __name__ == "__main__":
     with open(binary, "rb") as f:
         elf = ELFFile(f)
         arch = elfutils.get_arch(elf)
-        if arch is None:
-            log.fatal("Architecture not supported!")
         requested_linker = elfutils.get_interp(elf)
         dynamic = elfutils.get_dynamic(elf)
         log.info(f"bin: {binary} ({arch = })")
@@ -574,6 +592,8 @@ if __name__ == "__main__":
     elif libraries.get("libc", None):
         libc = libraries["libc"]
         log.info(f"libc: {libc}")
+        # TODO: if arch is "arm", use libc to decide between armel and armhf
+        # this can be determined with the flags in the header
         version = get_libc_version(libc, arch=arch)
 
         missing = []
@@ -603,7 +623,7 @@ if __name__ == "__main__":
             except OSError as exception:
                 log.error(f"Can't open {ld!r}: {exception!r}")
 
-        if do_unstrip and version and version.can_fetch_files:
+        if do_unstrip and version and version.pkgname and arch in version.supported_architectures:
             print()
             log.info("Finding stripped libraries to unstrip")
             unstrip_libs = get_stripped_libraries(libraries)

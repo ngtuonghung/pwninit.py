@@ -105,6 +105,15 @@ def get_runpath(elf):
 
 def get_arch(elf):
     return {
-        "EM_X86_64": "amd64",
-        "EM_386": "i386",
-    }.get(elf["e_machine"], None)
+        ('EM_X86_64', 64): 'amd64',
+        ('EM_X86_64', 32): 'amd64', # x32 ABI
+        ('EM_386', 32): 'i386',
+        ('EM_486', 32): 'i386',
+        ('EM_ARM', 32): 'arm',  # armel/armhf
+        ('EM_AARCH64', 64): 'arm64',
+        ('EM_MIPS', 32): 'mipsel',
+        ('EM_MIPS', 64): 'mips64el',
+        ('EM_PPC64', 64): 'ppc64el',
+        ('EM_RISCV', 64): 'riscv64',
+        ('EM_S390', 64): 's390x',
+    }.get((elf['e_machine'], elf.elfclass), elf['e_machine'])
