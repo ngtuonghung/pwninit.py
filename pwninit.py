@@ -472,7 +472,7 @@ def write_solvepy(binary, libraries, template=None):
         return False
     bindings = []
     binary_name = config.TEMPLATE_BINARY_NAME
-    bindings.append(f"{binary_name} = context.binary = ELF({binary!r})")
+    bindings.append(f"{binary_name} = context.binary = ELF({binary!r}, checksec=False)")
     # these may not exist if the binary is static
     libc = libraries.get("libc", None)
     ld = libraries.get("ld", None)

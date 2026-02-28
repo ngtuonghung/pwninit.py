@@ -4,6 +4,7 @@ import tarfile
 import tempfile
 
 import requests
+import tqdm
 import zstandard
 
 import utils
@@ -27,8 +28,14 @@ class DebPackage:
         # copy deb to temp folder
         self.tempdir = tempfile.mkdtemp()
         debpath = os.path.join(self.tempdir, debname)
-        with open(debpath, "wb+") as f:
-            shutil.copyfileobj(r.raw, f)
+        total = int(r.headers.get("Content-Length", 0)) or None
+        with open(debpath, "wb+") as f, tqdm.tqdm(
+            total=total, unit="B", unit_scale=True, unit_divisor=1024,
+            desc=debname, leave=False
+        ) as bar:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+                bar.update(len(chunk))
         # extract data.tar from deb to the same folder
         self.tar = self._get_data_tar(debpath)
 

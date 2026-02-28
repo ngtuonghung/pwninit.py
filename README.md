@@ -2,6 +2,15 @@
 
 A tool for intialization of ctf pwn challenges based on https://github.com/io12/pwninit.
 
+## Changes
+
+* **`setup.sh`**: Added automated setup script that installs system dependencies, creates a Python venv at `.venv/`, installs `requirements.txt`, and appends a `pwninit` alias to `~/.bashrc`. All steps are idempotent (skipped if already done). Reloads the shell via `exec bash` on completion.
+* **`templates/default.py`**: Consolidated tilix/tmux/WSL templates into a single file. Terminal is selected via an integer (`TERMINAL`: `1`=tilix, `2`=tmux, `3`=wsl). Added `USE_PTY` flag for PTY stdin/stdout/stderr on process spawn. Extracted GDB attachment into a dedicated `attach(p)` function with configurable `GDB_ATTACH_DELAY`.
+* **`pwninit.py`**: Added `checksec=False` to the generated `ELF()` binding for the binary in `solve.py`, consistent with libc and ld bindings.
+* **`deb.py`**: Added `tqdm` progress bar when downloading `.deb` packages.
+* **`requirements.txt`**: Added `tqdm`.
+* **`.gitignore`**: Added `.venv/`.
+
 ## Features
 
 * Downloads the correct interpreter to run the binary.
