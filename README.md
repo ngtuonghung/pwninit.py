@@ -9,11 +9,19 @@ A tool for intialization of ctf pwn challenges based on https://github.com/io12/
 * **`deb.py`**: Added `tqdm` progress bar when downloading `.deb` packages.
 * **`requirements.txt`**: Added `tqdm`.
 * **`.gitignore`**: Added `.venv/`.
+* **`pwninit.py`** (non-libc6 library support): Added automatic fetching of external shared libraries (e.g. `libcrypto.so.1.1`, `libssl.so.1.1`) that are required by the binary but not part of `libc6`. The correct Ubuntu package is located via the Launchpad REST API using the glibc version to determine the Ubuntu codename. Supported external libraries are listed in `EXTERNAL_LIB_TO_PACKAGE`. If a library cannot be fetched automatically and is not already present in the current directory, pwninit exits with a clear error message.
+* **`pwninit.py`** (recursive dependency resolution): Replaced the previous flat `fetch_missing_libraries` + `fetch_transitive_libc6_deps` approach with a fully recursive resolver (`resolve_lib` / `resolve_all_deps`). Starting from the binary's `NEEDED` entries, it fetches each missing library, then recurses into that library's own `NEEDED` entries, and so on until the full dependency tree is satisfied. After all deps are resolved, external libraries (non-libc6) are patched so their own `NEEDED` entries point to the local copies instead of the system ones. This fixes issues like `libcrypto.so.1.1` pulling in the system's `libdl.so.2` / `libpthread.so.0` (which are a newer glibc version) instead of the challenge's version.
+* **`deb.py`** (`.deb` package caching): `DebPackage` now accepts a `cache_dir` parameter. When set, downloaded `.deb` files are saved to that directory and reused on subsequent runs, avoiding redundant downloads. The cached path is made absolute to ensure `ar` can locate it regardless of working directory.
+* **`pwninit.py`** (`DEB_CACHE_DIR`): Downloaded `.deb` packages are cached in `./lib/` (relative to the challenge directory) by default, shared across the libc6, libc6-dbg, and external package downloads.
 
 ## Features
 
 * Downloads the correct interpreter to run the binary.
 * Downloads other standard glibc libraries required by the binary, like `libpthread` or `libm` for example.
+* **Recursively resolves the full shared library dependency tree**, including transitive dependencies of non-libc6 libraries.
+* **Automatically fetches non-libc6 libraries** (e.g. `libcrypto`, `libssl`, `libz`, `libstdc++`) from the matching Ubuntu package using the Launchpad API, based on the glibc version embedded in the provided libc.
+* **Patches external libraries** so their own NEEDED entries point to local copies, preventing version mismatches with system libraries.
+* **Caches downloaded `.deb` packages** in `./lib/` to avoid re-downloading on repeated runs.
 * Downloads debug symbols and unstrips all libraries, including `libc.so.*`, `ld-linux.so.*`, and other libraries.
 * Patches the binary to use the correct interpreter and libraries, either manually or with `patchelf`.
 * Writes a solve script to the current directory from a selection of customizable templates.
@@ -90,12 +98,13 @@ $ readelf -Wd ./chall | grep NEEDED
  0x0000000000000001 (NEEDED)             Shared library: [libpthread.so.0]
 $ pwninit.py 
 [*] bin: chall (arch = 'amd64')
-[*] libraries: {'libc': 'libc.so.6'}
 [*] libc: libc.so.6
 [*] libc version: (Ubuntu GLIBC 2.31-0ubuntu9.2) stable release version 2.31.
 
-[*] Fetching 'libpthread.so.0', 'ld-linux-x86-64.so.2' from https://launchpad.net/ubuntu/+archive/primary/+files/libc6_2.31-0ubuntu9.2_amd64.deb
+[*] Resolving library dependencies recursively (cache: 'lib')...
+[*] Fetching 'libpthread.so.0' from https://launchpad.net/ubuntu/+archive/primary/+files/libc6_2.31-0ubuntu9.2_amd64.deb
 [+] Successfully fetched 'libpthread.so.0'
+[*] Fetching 'ld-linux-x86-64.so.2' from https://launchpad.net/ubuntu/+archive/primary/+files/libc6_2.31-0ubuntu9.2_amd64.deb (cached)
 [+] Successfully fetched 'ld-linux-x86-64.so.2'
 
 [*] Finding stripped libraries to unstrip
@@ -114,7 +123,49 @@ $ pwninit.py
 [*] Writing solve.py
 [+] Successfully written solve.py
 $ ls
-chall  chall_patched  ld  ld-linux-x86-64.so.2  libc  libc.so.6  libpthread  libpthread.so.0  solve.py
+chall  chall_patched  ld  ld-linux-x86-64.so.2  lib/  libc  libc.so.6  libpthread  libpthread.so.0  solve.py
+```
+
+#### Example with a binary that requires OpenSSL (`libcrypto.so.1.1`)
+
+```bash
+$ ls
+chall  libc.so.6
+$ readelf -Wd ./chall | grep NEEDED
+ 0x0000000000000001 (NEEDED)             Shared library: [libcrypto.so.1.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+$ pwninit.py
+[*] bin: chall (arch = 'amd64')
+[*] libc: libc.so.6
+[*] libc version: (Ubuntu GLIBC 2.27-3ubuntu1) stable release version 2.27.
+
+[*] Resolving library dependencies recursively (cache: 'lib')...
+
+[*] Fetching 'libcrypto.so.1.1' from https://launchpadlibrarian.net/.../libssl1.1_1.1.1-1ubuntu2.1~18.04.23_amd64.deb
+[+] Successfully fetched 'libcrypto.so.1.1'
+[*] Fetching 'libdl.so.2' from https://.../libc6_2.27-3ubuntu1_amd64.deb
+[+] Successfully fetched 'libdl.so.2'
+[*] Fetching 'libpthread.so.0' from https://.../libc6_2.27-3ubuntu1_amd64.deb (cached)
+[+] Successfully fetched 'libpthread.so.0'
+[*] Fetching 'ld-linux-x86-64.so.2' from https://.../libc6_2.27-3ubuntu1_amd64.deb (cached)
+[+] Successfully fetched 'ld-linux-x86-64.so.2'
+
+[*] Patching transitive deps in 'libcrypto.so.1.1'
+[*] Symlinking './libdl' -> 'libdl.so.2'
+[*] Symlinking './libpthread' -> 'libpthread.so.0'
+
+[*] Finding stripped libraries to unstrip
+[*] Unstripping 'libcrypto.so.1.1', 'libdl.so.2', 'libpthread.so.0', 'ld-linux-x86-64.so.2'
+...
+
+[*] Patching binary manually
+[*] Symlinking './ld' -> 'ld-linux-x86-64.so.2'
+[*] Symlinking './libcrypto' -> 'libcrypto.so.1.1'
+[*] Symlinking './libc' -> 'libc.so.6'
+[+] Successfully wrote patched binary to 'chall_patched'
+
+[*] Writing solve.py
+[+] Successfully written solve.py
 ```
 
 ### `pwnsrc.py`

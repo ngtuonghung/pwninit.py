@@ -11,12 +11,21 @@ import utils
 
 
 class DebPackage:
-    def __init__(self, url):
+    def __init__(self, url, cache_dir=None):
         self.tar = None
-        self.tempdir = None
+        self.tempdir = tempfile.mkdtemp()  # always needed for tar extraction
         self.error = None
-        # fetch deb
         debname = url.split("/")[-1]
+        # Use cached deb if available
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            debpath = os.path.abspath(os.path.join(cache_dir, debname))
+            if os.path.isfile(debpath):
+                self.tar = self._get_data_tar(debpath)
+                return
+        else:
+            debpath = os.path.join(self.tempdir, debname)
+        # Download
         try:
             r = requests.get(url, stream=True)
         except Exception as exception:
@@ -25,9 +34,6 @@ class DebPackage:
         if r.status_code != 200:
             self.error = f"GET request returned {r.status_code}"
             return
-        # copy deb to temp folder
-        self.tempdir = tempfile.mkdtemp()
-        debpath = os.path.join(self.tempdir, debname)
         total = int(r.headers.get("Content-Length", 0)) or None
         with open(debpath, "wb+") as f, tqdm.tqdm(
             total=total, unit="B", unit_scale=True, unit_divisor=1024,
@@ -36,7 +42,7 @@ class DebPackage:
             for chunk in r.iter_content(chunk_size=65536):
                 f.write(chunk)
                 bar.update(len(chunk))
-        # extract data.tar from deb to the same folder
+        # extract data.tar from deb to the tempdir
         self.tar = self._get_data_tar(debpath)
 
     def _extract_file_deb(self, deb, name, folder="."):

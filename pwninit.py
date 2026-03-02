@@ -164,8 +164,263 @@ class LibcVersion:
         return self.raw
 
 
+# Library names that ship inside the libc6 (glibc) debian package.
+# libcrypto, libssl, libz, etc. are NOT here and must be provided manually.
+LIBC6_LIB_NAMES = frozenset({
+    "ld", "libc", "libm", "libpthread", "libdl", "libresolv",
+    "librt", "libanl", "libutil", "libcrypt", "libBrokenLocale",
+    "libthread_db", "libnsl",
+})
+
+def is_libc6_lib(lib_name):
+    """Return True if lib_name is expected to be part of the libc6 package."""
+    return lib_name in LIBC6_LIB_NAMES or lib_name.startswith("libnss_")
+
+# Maps glibc version tuple (major, minor) to Ubuntu codename.
+GLIBC_VERSION_TO_CODENAME = {
+    (2, 17): "saucy",
+    (2, 19): "trusty",
+    (2, 21): "vivid",
+    (2, 23): "xenial",
+    (2, 24): "stretch",  # Debian
+    (2, 26): "artful",
+    (2, 27): "bionic",
+    (2, 28): "cosmic",
+    (2, 29): "disco",
+    (2, 30): "eoan",
+    (2, 31): "focal",
+    (2, 32): "groovy",
+    (2, 33): "hirsute",
+    (2, 34): "impish",
+    (2, 35): "jammy",
+    (2, 36): "kinetic",
+    (2, 37): "lunar",
+    (2, 38): "mantic",
+    (2, 39): "noble",
+    (2, 40): "oracular",
+}
+
+# Maps lib name (from get_lib_name()) to Ubuntu package name that ships it.
+# The value is a list of candidate package names to try, in order.
+EXTERNAL_LIB_TO_PACKAGE = {
+    # libcrypto.so.1.1 and libssl.so.1.1 come from libssl1.1
+    # libcrypto.so.3 and libssl.so.3 come from libssl3
+    # libcrypto.so.1.0.0 and libssl.so.1.0.0 come from libssl1.0.0
+    "libcrypto": ["libssl3", "libssl1.1", "libssl1.0.0"],
+    "libssl":    ["libssl3", "libssl1.1", "libssl1.0.0"],
+    "libz":      ["zlib1g"],
+    "libgmp":    ["libgmp10"],
+    "libgcc_s":  ["libgcc-s1", "libgcc1"],
+    "libstdc++": ["libstdc++6"],
+}
+
+# Directory where downloaded .deb packages are cached to avoid re-downloading.
+DEB_CACHE_DIR = "lib"
+
+
 # takes the form: libname.so.XXX, libname.so, libname-2.27.so, libname_2.27.so
 # also accepts: libcXXX, ld-XXX, ld
+def query_launchpad_pkg_url(pkgname, codename, arch):
+    """Query the Launchpad REST API to get the latest .deb download URL."""
+    import requests as _requests
+    api = "https://api.launchpad.net/devel"
+    headers = {"Accept": "application/json"}
+    try:
+        r = _requests.get(
+            f"{api}/ubuntu/+archive/primary",
+            params={
+                "ws.op": "getPublishedBinaries",
+                "binary_name": pkgname,
+                # must be a full absolute URL, not a relative path
+                "distro_arch_series": f"{api}/ubuntu/{codename}/{arch}",
+                "status": "Published",
+                "ordered_by_date": "true",  # correct param; ws.orderby causes 400
+                "ws.size": "1",
+            },
+            headers=headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        entries = r.json().get("entries", [])
+    except Exception as e:
+        return None, str(e)
+    if not entries:
+        return None, f"No published binary for {pkgname!r} in {codename}/{arch}"
+    self_link = entries[0]["self_link"]
+    try:
+        r2 = _requests.get(
+            self_link,
+            params={"ws.op": "binaryFileUrls"},
+            headers=headers,
+            timeout=20,
+        )
+        r2.raise_for_status()
+        urls = r2.json()
+    except Exception as e:
+        return None, str(e)
+    for u in urls:
+        if isinstance(u, str) and u.endswith(".deb"):
+            return u, None
+    return None, f"No .deb URL in binaryFileUrls for {pkgname!r}"
+
+
+def extract_from_deb(url, pkg_paths, dst_filename, cache_dir=None):
+    """Download (or use cached) deb and extract a single file from it.
+    pkg_paths: list of in-archive paths to try in order.
+    Returns True on success, False on failure."""
+    with deb.DebPackage(url, cache_dir=cache_dir) as pkg:
+        tar = pkg.tar
+        if tar is None:
+            log.error(f"Failed to open package: {pkg.error!r}")
+            return False
+        for path in pkg_paths:
+            try:
+                fsrc = tar.extractfile(path)
+                if fsrc is None:
+                    continue
+                with open(dst_filename, "wb+") as fdst, fsrc:
+                    shutil.copyfileobj(fsrc, fdst)
+                return True
+            except KeyError:
+                continue
+    return False
+
+
+def fetch_lib_libc6(needed_lib, version, cache_dir=None):
+    """Fetch a single libc6 library from the libc6 deb. Returns local filename or None."""
+    if version is None or not version.pkgname:
+        return None
+    if version.arch not in version.supported_architectures:
+        return None
+    name = os.path.basename(needed_lib)
+    pkg_paths = version.get_libc6_pkg_paths(name)
+    url = version.libc_pkgurl
+    log.info(f"Fetching {name!r} from {url}")
+    if extract_from_deb(url, pkg_paths, name, cache_dir=cache_dir):
+        log.success(f"Successfully fetched {name!r}")
+        return name
+    log.error(f"Failed to fetch {name!r}")
+    return None
+
+
+def fetch_lib_external(needed_lib, lib_name, version, cache_dir=None):
+    """Fetch a non-libc6 library from its matching Ubuntu package via Launchpad.
+    Returns local filename on success, None on failure."""
+    if version is None or not version.version:
+        return None
+    codename = GLIBC_VERSION_TO_CODENAME.get(version.version[:2])
+    if codename is None:
+        return None
+    ubuntu_arch = version.arch
+    candidate_pkgs = EXTERNAL_LIB_TO_PACKAGE.get(lib_name)
+    if not candidate_pkgs:
+        return None
+    lib_filename = os.path.basename(needed_lib)
+    arch_linux_gnu = version.arch_linux_gnu
+    paths = []
+    if arch_linux_gnu:
+        paths += [
+            f"./usr/lib/{arch_linux_gnu}/{lib_filename}",
+            f"./lib/{arch_linux_gnu}/{lib_filename}",
+        ]
+    paths += [f"./usr/lib/{lib_filename}", f"./lib/{lib_filename}"]
+    for pkgname in candidate_pkgs:
+        deb_url, _ = query_launchpad_pkg_url(pkgname, codename, ubuntu_arch)
+        if deb_url is None:
+            continue
+        print()
+        log.info(f"Fetching {lib_filename!r} from {deb_url}")
+        if extract_from_deb(deb_url, paths, lib_filename, cache_dir=cache_dir):
+            log.success(f"Successfully fetched {lib_filename!r}")
+            return lib_filename
+        log.warning(f"Couldn't find {lib_filename!r} in package {pkgname!r}")
+    return None
+
+
+def resolve_lib(needed_lib, version, libraries, cache_dir, visited):
+    """Recursively resolve a single library and all its transitive dependencies.
+    Fetches missing libs, then recurses into their NEEDED entries.
+    Updates `libraries` in place. Returns local path or None."""
+    lib_name = get_lib_name(needed_lib)
+    if lib_name in visited:
+        return libraries.get(lib_name)
+    visited.add(lib_name)
+
+    # Already have it?
+    local_path = libraries.get(lib_name)
+    if local_path is None:
+        # Check if user placed it in the current directory
+        local_candidate = os.path.join(".", os.path.basename(needed_lib))
+        if os.path.isfile(local_candidate) and elfutils.is_elf(local_candidate):
+            log.info(f"Found {needed_lib!r} locally at {local_candidate!r}")
+            local_path = local_candidate
+        elif is_libc6_lib(lib_name):
+            local_path = fetch_lib_libc6(needed_lib, version, cache_dir=cache_dir)
+            if local_path:
+                utils.chmod_x(local_path)
+        else:
+            local_path = fetch_lib_external(needed_lib, lib_name, version, cache_dir=cache_dir)
+            if local_path:
+                utils.chmod_x(local_path)
+
+    if local_path is None:
+        return None
+
+    libraries[lib_name] = local_path
+
+    # Recurse into this library's own NEEDED entries
+    try:
+        with open(local_path, "rb") as f:
+            elf = ELFFile(f)
+            dyn = elfutils.get_dynamic(elf)
+            if dyn:
+                for transitive_lib in elfutils.get_needed_from_dynamic(dyn):
+                    resolve_lib(transitive_lib, version, libraries, cache_dir, visited)
+    except Exception:
+        pass
+
+    return local_path
+
+
+def resolve_all_deps(initial_needed, requested_linker, libraries, version, cache_dir):
+    """Recursively resolve all shared library dependencies starting from the
+    binary's NEEDED list. Fetches missing libs, recurses into their deps,
+    then patches all external libs so their NEEDED entries point to local copies."""
+    os.makedirs(cache_dir, exist_ok=True)
+    # Seed visited with libs we already have so we don't re-process them
+    visited = set(libraries.keys())
+
+    all_needed = list(initial_needed)
+    if requested_linker and get_lib_name(requested_linker) not in visited:
+        all_needed.append(requested_linker)
+
+    failed = []
+    for needed_lib in all_needed:
+        lib_name = get_lib_name(needed_lib)
+        if lib_name in visited:
+            continue
+        result = resolve_lib(needed_lib, version, libraries, cache_dir, visited)
+        if result is None:
+            failed.append(needed_lib)
+
+    if failed:
+        print()
+        log.error("Could not automatically fetch the following libraries:")
+        for lib in failed:
+            local_path = os.path.join(".", os.path.basename(lib))
+            log.error(f"  {lib!r} -> please place it manually at {local_path!r}")
+        log.fatal("Provide the missing libraries and re-run pwninit")
+
+    # Patch external libs (e.g. libcrypto) so their transitive NEEDED entries
+    # resolve to local copies instead of system libs
+    print()
+    for lib_name, lib_path in list(libraries.items()):
+        if is_libc6_lib(lib_name):
+            continue
+        log.info(f"Patching transitive deps in {lib_path!r}")
+        patch_binary(lib_path, libraries, output=lib_path)
+
+
 def get_lib_name(lib, strict=False):
     basename = os.path.basename(lib)
     # ld names are more complex than other libraries
@@ -244,7 +499,9 @@ def find_binaries(binary=None, libc=None, ld=None, folder=".", libraries=None):
     return binary, libraries
 
 
-def fetch_missing_libraries(missing, libraries, version):
+def fetch_missing_libraries(missing, libraries, version, cache_dir=None):
+    """Batch-fetch multiple libc6 libraries from the libc6 deb in one pass.
+    Uses cache_dir to avoid re-downloading the deb."""
     missing_list = ', '.join(repr(m) for m in missing)
     if version is None:
         log.error(f"Can't fetch {missing_list} without knowing the libc version")
@@ -265,7 +522,7 @@ def fetch_missing_libraries(missing, libraries, version):
     dsts_list = ', '.join(repr(d) for d in dsts)
     log.info(f"Fetching {dsts_list} from {url}")
     successes = []
-    with deb.DebPackage(url) as pkg:
+    with deb.DebPackage(url, cache_dir=cache_dir) as pkg:
         tar = pkg.tar
         if tar is None:
             log.error(f"Failed to fetch files: {pkg.error!r}")
@@ -273,7 +530,6 @@ def fetch_missing_libraries(missing, libraries, version):
         for files, dst in zip(missing, dsts):
             fsrc = None
             for file in files:
-                name = os.path.basename(file)
                 try:
                     fsrc = tar.extractfile(file)
                     break
@@ -282,7 +538,6 @@ def fetch_missing_libraries(missing, libraries, version):
             else:
                 log.error(f"Failed to fetch {dst!r}")
                 continue
-
             with open(dst, "wb+") as fdst, fsrc:
                 shutil.copyfileobj(fsrc, fdst)
             successes.append(dst)
@@ -596,27 +851,16 @@ if __name__ == "__main__":
         # this can be determined with the flags in the header
         version = get_libc_version(libc, arch=arch)
 
-        missing = []
-        for needed_lib in needed:
-            lib_name = get_lib_name(needed_lib)
-            if libraries.get(lib_name, None) is None:
-                missing.append(needed_lib)
-
-        ld = libraries.get("ld", None)
-        if ld is None:
-            if requested_linker:
-                missing.append(requested_linker)
-        else:
-            log.info(f"ld: {ld}")
-
-        if missing:
-            fetch_missing_libraries(missing, libraries, version)
+        print()
+        log.info(f"Resolving library dependencies recursively (cache: {DEB_CACHE_DIR!r})...")
+        resolve_all_deps(needed, requested_linker, libraries, version, DEB_CACHE_DIR)
 
         # it's possible that fetching the interpreter failed
         ld = libraries.get("ld", None)
         if ld is None:
             log.error("Interpreter not found")
         else:
+            log.info(f"ld: {ld}")
             try:
                 open(ld, "rb").close()
                 utils.chmod_x(ld)
