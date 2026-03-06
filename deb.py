@@ -21,6 +21,8 @@ class DebPackage:
             os.makedirs(cache_dir, exist_ok=True)
             debpath = os.path.abspath(os.path.join(cache_dir, debname))
             if os.path.isfile(debpath):
+                import log as _log
+                _log.info(f"Using cached {debname!r} from {cache_dir!r}")
                 self.tar = self._get_data_tar(debpath)
                 return
         else:

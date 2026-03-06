@@ -278,28 +278,37 @@ def extract_from_deb(url, pkg_paths, dst_filename, cache_dir=None):
                 fsrc = tar.extractfile(path)
                 if fsrc is None:
                     continue
+                log.info(f"Extracting {path!r} -> {dst_filename!r}")
                 with open(dst_filename, "wb+") as fdst, fsrc:
                     shutil.copyfileobj(fsrc, fdst)
                 return True
             except KeyError:
+                log.info(f"Path {path!r} not found in archive, trying next")
                 continue
+    log.error(f"None of the candidate paths were found in the archive for {dst_filename!r}")
     return False
 
 
 def fetch_lib_libc6(needed_lib, version, cache_dir=None):
     """Fetch a single libc6 library from the libc6 deb. Returns local filename or None."""
-    if version is None or not version.pkgname:
+    if version is None:
+        log.warning(f"Skipping fetch of {needed_lib!r}: libc version is unknown")
+        return None
+    if not version.pkgname:
+        log.warning(f"Skipping fetch of {needed_lib!r}: libc package name not available")
         return None
     if version.arch not in version.supported_architectures:
+        log.warning(f"Skipping fetch of {needed_lib!r}: arch {version.arch!r} not supported for {version.os!r}")
         return None
     name = os.path.basename(needed_lib)
     pkg_paths = version.get_libc6_pkg_paths(name)
     url = version.libc_pkgurl
-    log.info(f"Fetching {name!r} from {url}")
+    log.info(f"Fetching {name!r} from libc6 package: {url}")
+    log.info(f"  Trying archive paths: {pkg_paths}")
     if extract_from_deb(url, pkg_paths, name, cache_dir=cache_dir):
         log.success(f"Successfully fetched {name!r}")
         return name
-    log.error(f"Failed to fetch {name!r}")
+    log.error(f"Failed to fetch {name!r} from libc6")
     return None
 
 
@@ -325,8 +334,9 @@ def fetch_lib_external(needed_lib, lib_name, version, cache_dir=None):
         ]
     paths += [f"./usr/lib/{lib_filename}", f"./lib/{lib_filename}"]
     for pkgname in candidate_pkgs:
-        deb_url, _ = query_launchpad_pkg_url(pkgname, codename, ubuntu_arch)
+        deb_url, err = query_launchpad_pkg_url(pkgname, codename, ubuntu_arch)
         if deb_url is None:
+            log.warning(f"Launchpad query for {pkgname!r} ({codename}/{ubuntu_arch}) failed: {err}")
             continue
         print()
         log.info(f"Fetching {lib_filename!r} from {deb_url}")
@@ -334,39 +344,55 @@ def fetch_lib_external(needed_lib, lib_name, version, cache_dir=None):
             log.success(f"Successfully fetched {lib_filename!r}")
             return lib_filename
         log.warning(f"Couldn't find {lib_filename!r} in package {pkgname!r}")
+    log.error(f"Could not fetch {lib_filename!r}: tried {candidate_pkgs} on {codename}/{ubuntu_arch}")
     return None
 
 
-def resolve_lib(needed_lib, version, libraries, cache_dir, visited):
+def resolve_lib(needed_lib, version, libraries, cache_dir, visited, failed):
     """Recursively resolve a single library and all its transitive dependencies.
     Fetches missing libs, then recurses into their NEEDED entries.
-    Updates `libraries` in place. Returns local path or None."""
+    Updates `libraries` in place. Returns local path or None.
+    Unresolvable libs are added to `failed` (a set)."""
     lib_name = get_lib_name(needed_lib)
     if lib_name in visited:
-        return libraries.get(lib_name)
+        existing = libraries.get(lib_name)
+        if existing:
+            log.info(f"Already resolved {needed_lib!r} -> {existing!r}, skipping")
+        else:
+            log.info(f"Already attempted {needed_lib!r} (previously failed), skipping")
+        return existing
     visited.add(lib_name)
+
+    log.info(f"Resolving {needed_lib!r} (lib_name={lib_name!r})")
 
     # Already have it?
     local_path = libraries.get(lib_name)
-    if local_path is None:
+    if local_path is not None:
+        log.info(f"  Already in libraries: {local_path!r}")
+    else:
         # Check if user placed it in the current directory
         local_candidate = os.path.join(".", os.path.basename(needed_lib))
         if os.path.isfile(local_candidate) and elfutils.is_elf(local_candidate):
-            log.info(f"Found {needed_lib!r} locally at {local_candidate!r}")
+            log.info(f"  Found locally at {local_candidate!r}")
             local_path = local_candidate
         elif is_libc6_lib(lib_name):
+            log.info(f"  Identified as libc6 library, fetching from libc6 deb")
             local_path = fetch_lib_libc6(needed_lib, version, cache_dir=cache_dir)
             if local_path:
                 utils.chmod_x(local_path)
         else:
+            log.info(f"  Identified as external library, fetching from Ubuntu package")
             local_path = fetch_lib_external(needed_lib, lib_name, version, cache_dir=cache_dir)
             if local_path:
                 utils.chmod_x(local_path)
 
     if local_path is None:
+        log.error(f"  Failed to resolve {needed_lib!r}")
+        failed.add(needed_lib)
         return None
 
     libraries[lib_name] = local_path
+    log.info(f"  Resolved {needed_lib!r} -> {local_path!r}")
 
     # Recurse into this library's own NEEDED entries
     try:
@@ -374,10 +400,13 @@ def resolve_lib(needed_lib, version, libraries, cache_dir, visited):
             elf = ELFFile(f)
             dyn = elfutils.get_dynamic(elf)
             if dyn:
-                for transitive_lib in elfutils.get_needed_from_dynamic(dyn):
-                    resolve_lib(transitive_lib, version, libraries, cache_dir, visited)
-    except Exception:
-        pass
+                transitive = elfutils.get_needed_from_dynamic(dyn)
+                if transitive:
+                    log.info(f"  {local_path!r} needs: {transitive}")
+                for transitive_lib in transitive:
+                    resolve_lib(transitive_lib, version, libraries, cache_dir, visited, failed)
+    except Exception as e:
+        log.warning(f"  Could not read NEEDED entries from {local_path!r}: {e}")
 
     return local_path
 
@@ -389,36 +418,54 @@ def resolve_all_deps(initial_needed, requested_linker, libraries, version, cache
     os.makedirs(cache_dir, exist_ok=True)
     # Seed visited with libs we already have so we don't re-process them
     visited = set(libraries.keys())
+    failed = set()  # all unresolvable libs (at any depth)
 
     all_needed = list(initial_needed)
     if requested_linker and get_lib_name(requested_linker) not in visited:
         all_needed.append(requested_linker)
 
-    failed = []
+    log.info(f"Libraries already present: {list(libraries.keys()) or 'none'}")
+    log.info(f"Direct NEEDED entries to resolve: {all_needed}")
+
+    direct_failed = []
     for needed_lib in all_needed:
         lib_name = get_lib_name(needed_lib)
         if lib_name in visited:
+            log.info(f"Skipping {needed_lib!r}: already provided")
             continue
-        result = resolve_lib(needed_lib, version, libraries, cache_dir, visited)
+        result = resolve_lib(needed_lib, version, libraries, cache_dir, visited, failed)
         if result is None:
-            failed.append(needed_lib)
+            direct_failed.append(needed_lib)
 
-    if failed:
+    log.info(f"Resolved libraries: {list(libraries.keys())}")
+
+    # Transitive failures: warn but don't fatal — user can place them manually
+    transitive_failed = failed - set(direct_failed)
+    if transitive_failed:
         print()
-        log.error("Could not automatically fetch the following libraries:")
-        for lib in failed:
+        log.warning("Could not automatically fetch some transitive dependencies:")
+        for lib in sorted(transitive_failed):
+            local_path = os.path.join(".", os.path.basename(lib))
+            log.warning(f"  {lib!r} -> place manually at {local_path!r} and re-run")
+
+    # Direct binary deps failing is fatal
+    if direct_failed:
+        print()
+        log.error("Could not automatically fetch the following required libraries:")
+        for lib in direct_failed:
             local_path = os.path.join(".", os.path.basename(lib))
             log.error(f"  {lib!r} -> please place it manually at {local_path!r}")
         log.fatal("Provide the missing libraries and re-run pwninit")
 
     # Patch external libs (e.g. libcrypto) so their transitive NEEDED entries
     # resolve to local copies instead of system libs
-    print()
-    for lib_name, lib_path in list(libraries.items()):
-        if is_libc6_lib(lib_name):
-            continue
-        log.info(f"Patching transitive deps in {lib_path!r}")
-        patch_binary(lib_path, libraries, output=lib_path)
+    external_libs = [(n, p) for n, p in libraries.items() if not is_libc6_lib(n)]
+    if external_libs:
+        print()
+        log.info(f"Patching NEEDED entries in {len(external_libs)} external lib(s): {[p for _, p in external_libs]}")
+        for lib_name, lib_path in external_libs:
+            log.info(f"Patching transitive deps in {lib_path!r}")
+            patch_binary(lib_path, libraries, output=lib_path)
 
 
 def get_lib_name(lib, strict=False):
@@ -563,12 +610,12 @@ def get_stripped_libraries(libraries):
     return unstrip_libs
 
 
-def unstrip_libraries(libraries, version):
+def unstrip_libraries(libraries, version, cache_dir=None):
     tempdir = tempfile.mkdtemp()
     debug_syms = {}
     url = version.libc_dbg_pkgurl
     log.info(f"Fetching debug symbols from {url}")
-    with deb.DebPackage(url) as pkg:
+    with deb.DebPackage(url, cache_dir=cache_dir) as pkg:
         tar = pkg.tar
         if tar is None:
             log.error(f"Failed to fetch files: {pkg.error!r}")
@@ -874,7 +921,7 @@ if __name__ == "__main__":
             if unstrip_libs:
                 unstrip_libs_list = ', '.join(map(lambda x: repr(x[0]), unstrip_libs))
                 log.info(f"Unstripping {unstrip_libs_list}")
-                unstrip_libraries(unstrip_libs, version)
+                unstrip_libraries(unstrip_libs, version, cache_dir=DEB_CACHE_DIR)
             else:
                 log.warning("No libraries to unstrip")
 
