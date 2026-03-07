@@ -3,6 +3,7 @@ from pwn import *
 import shutil
 sla = lambda p, d, x: p.sendlineafter(d, x)
 sa = lambda p, d, x: p.sendafter(d, x)
+sl = lambda p, x: p.sendline(x)
 s = lambda p, x: p.send(x)
 slan = lambda p, d, n: p.sendlineafter(d, str(n).encode())
 ru = lambda p, x, t=5: p.recvuntil(x, timeout=5)
